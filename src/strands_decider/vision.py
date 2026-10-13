@@ -464,12 +464,14 @@ class VisionEngine(SystemOneEngine):
 
     def _fit_images(
         self, state: Content, images: list[Image.Image], question_texts: list[str]
-    ) -> tuple[list[int], list[list[int]], dict[str, torch.Tensor]]:
+    ) -> tuple[list[int], list[list[int]], dict[str, torch.Tensor], list[list[tuple[int, int]]]]:
         """Question reserve first, then the image block whole, then state text.
 
         As in `_fit`: with `strict_window` an over-long prompt is refused (HTTP 422);
         otherwise the questions keep their reserve and the state text loses its end, the
-        same side `_fit` and training cut. The images are never cut.
+        same side `_fit` and training cut. The images are never cut. Returns the state ids,
+        question ids, multimodal tensors, and per-question option offsets (as a local, not
+        on the engine -- see `_fit` for the reason).
         """
         max_len = self.model.config.max_length
         enc = self.tok(question_texts, add_special_tokens=False, return_offsets_mapping=True)
@@ -491,11 +493,10 @@ class VisionEngine(SystemOneEngine):
                     f"prompt of {len(s) + longest} tokens exceeds the context window "
                     f"of {max_len} tokens"
                 )
-            self._last_offsets = list(offs)
-            return s, q, mm
+            return s, q, mm, list(offs)
         reserve = min(longest, max(1, int(max_len * self.cfg.max_question_fraction)))
         cut = [max(0, len(x) - reserve) for x in q]
-        self._last_offsets = [o[c:] for o, c in zip(offs, cut, strict=True)]
+        kept = [o[c:] for o, c in zip(offs, cut, strict=True)]
         q = [x[c:] for x, c in zip(q, cut, strict=True)]
         budget = max_len - reserve
         if keep > budget:
@@ -504,14 +505,14 @@ class VisionEngine(SystemOneEngine):
                 "send fewer or smaller images"
             )
         s = s[:budget]
-        return s, q, mm
+        return s, q, mm, kept
 
     @torch.inference_mode()  # type: ignore[untyped-decorator]
     def _image_probs(
         self, state: Content, images: list[Image.Image], rendered: list[RenderedQuestion]
     ) -> tuple[torch.Tensor, int]:
         m = len(rendered)
-        s, q, mm = self._fit_images(state, images, [rq.text for rq in rendered])
+        s, q, mm, offsets = self._fit_images(state, images, [rq.text for rq in rendered])
         prefix_ids = torch.tensor([s], device=self.device)
         n = prefix_ids.size(1)
         tt = mm_token_type_ids(self.model.torso, prefix_ids)
@@ -543,7 +544,7 @@ class VisionEngine(SystemOneEngine):
             position_ids=torch.cat([st, (st + delta).expand(3, m, -1)], dim=0),
         )
         pooled = pool_last_token(hidden, full_mask).to(torch.float32)
-        options = gather_options(hidden, self._option_idx(rendered, 0)).to(torch.float32)
+        options = gather_options(hidden, self._option_idx(rendered, 0, offsets)).to(torch.float32)
         head: Any = self.model.head
         logits = apply_temperature(head(pooled, options),
                                    self._temperatures([rq.kind for rq in rendered]))

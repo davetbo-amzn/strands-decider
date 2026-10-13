@@ -185,7 +185,9 @@ class SystemOneEngine:
         )
 
 
-    def _fit(self, state_text: str, question_texts: list[str]) -> tuple[list[int], list[list[int]]]:
+    def _fit(
+        self, state_text: str, question_texts: list[str]
+    ) -> tuple[list[int], list[list[int]], list[list[tuple[int, int]]]]:
         """Tokenise state and questions, giving the QUESTION first claim on the window.
 
         The question and its options are what make a task answerable; the state is the
@@ -200,6 +202,10 @@ class SystemOneEngine:
         tail. The options and the trailing `<answer>` marker are structurally required
         -- `<answer>` is the pooling position, so losing it makes the head read an
         arbitrary token -- whereas losing some instruction text only costs meaning.
+
+        Returns state ids, question ids, and each question's character offsets. The
+        offsets are returned, not kept on the engine: the server runs requests
+        concurrently on one engine, so engine state would be shared across requests.
         """
         max_len = self.model.config.max_length
         enc = self.tok(question_texts, add_special_tokens=False,
@@ -214,14 +220,13 @@ class SystemOneEngine:
                     f"prompt of {len(s) + longest} tokens exceeds the context window "
                     f"of {max_len} tokens"
                 )
-            self._last_offsets = list(offs)
-            return s, q
+            return s, q, list(offs)
         # Cap the reserve so a pathological question cannot starve the state entirely.
         reserve = min(longest, max(1, int(max_len * self.cfg.max_question_fraction)))
         # Front truncation shifts every token index, so the offsets move with the ids
         # and a pointer readout keeps pointing at the right option.
         cut = [max(0, len(x) - reserve) for x in q]
-        self._last_offsets = [o[c:] for o, c in zip(offs, cut, strict=True)]
+        kept = [o[c:] for o, c in zip(offs, cut, strict=True)]
         q = [x[c:] for x, c in zip(q, cut, strict=True)]
         state_budget = max(1, max_len - reserve)
         s = self.tok(
@@ -230,18 +235,21 @@ class SystemOneEngine:
             truncation=True,
             max_length=state_budget,
         )["input_ids"]
-        return s, q
+        return s, q, kept
 
-    def _option_idx(self, rendered: list[RenderedQuestion], base: int) -> torch.Tensor:
+    def _option_idx(
+        self, rendered: list[RenderedQuestion], base: int,
+        offsets: list[list[tuple[int, int]]],
+    ) -> torch.Tensor:
         """Option token positions for a pointer head, offset by `base`.
 
         `base` is 0 when the caller forwards only the question (the shared-prefix path,
         where `hidden` is the suffix) and the state's token count when it forwards the
-        whole prompt. Uses the offsets `_fit` kept, so front truncation is accounted for.
+        whole prompt. `offsets` are `_fit`'s, so front truncation is accounted for.
         """
         rows = [
             _option_token_index(offs, rq.option_spans, 0)
-            for rq, offs in zip(rendered, self._last_offsets, strict=True)
+            for rq, offs in zip(rendered, offsets, strict=True)
         ]
         width = max(len(r) for r in rows)
         return torch.tensor(
@@ -268,6 +276,7 @@ class SystemOneEngine:
     def _slot_probs_batched(
         self, s: list[int], q: list[list[int]],
         n_slots: list[int], kinds: list[str],
+        offsets: list[list[tuple[int, int]]],
         rendered: list[RenderedQuestion] | None = None,
     ) -> tuple[torch.Tensor, int]:
         """Fallback: encode each full prompt independently, from `_fit`'s state `s` and
@@ -281,7 +290,7 @@ class SystemOneEngine:
         ids, mask = self._pad([s + qi for qi in q])
         # This path forwards the whole prompt, so option positions sit after the state.
         assert rendered is not None or self.model.config.head_type != "pointer"
-        opt_idx = (self._option_idx(rendered, len(s))  # type: ignore[arg-type]
+        opt_idx = (self._option_idx(rendered, len(s), offsets)  # type: ignore[arg-type]
                    if self.model.config.head_type == "pointer" else None)
         out = self.model(
             input_ids=ids,
@@ -299,6 +308,7 @@ class SystemOneEngine:
         q: list[list[int]],
         n_slots: list[int],
         kinds: list[str],
+        offsets: list[list[tuple[int, int]]],
         rendered: list[RenderedQuestion] | None = None,
     ) -> tuple[torch.Tensor, int]:
         """Encode the state `s` once, then all question suffixes `q` against that cache."""
@@ -340,7 +350,7 @@ class SystemOneEngine:
             from .modeling import gather_options
 
             assert rendered is not None
-            options = gather_options(hidden, self._option_idx(rendered, 0))
+            options = gather_options(hidden, self._option_idx(rendered, 0, offsets))
             raw = self.model.head(pooled, options.to(torch.float32))
         else:
             raw = self.model.head(pooled)
@@ -380,7 +390,6 @@ class SystemOneEngine:
         total_tokens = 0
 
         for chunk, state_ids, question_ids, offsets in self._chunks(state_text, rendered):
-            self._last_offsets = offsets  # what _option_idx reads
             chunk_rendered = rendered[chunk]
             chunk_slots = n_slots[chunk]
             chunk_kinds = [rq.kind for rq in chunk_rendered]
@@ -392,7 +401,8 @@ class SystemOneEngine:
             if self.cfg.use_prefix_cache and len(chunk_rendered) > 1:
                 try:
                     probs, ntok = self._slot_probs_shared_prefix(
-                        state_ids, question_ids, chunk_slots, chunk_kinds, rendered=chunk_rendered,
+                        state_ids, question_ids, chunk_slots, chunk_kinds, offsets,
+                        rendered=chunk_rendered,
                     )
                     total_tokens += ntok
                 except UnforkableCache as e:
@@ -400,7 +410,8 @@ class SystemOneEngine:
                     self.cfg = replace(self.cfg, use_prefix_cache=False)
             if probs is None:
                 probs, ntok = self._slot_probs_batched(
-                    state_ids, question_ids, chunk_slots, chunk_kinds, rendered=chunk_rendered,
+                    state_ids, question_ids, chunk_slots, chunk_kinds, offsets,
+                    rendered=chunk_rendered,
                 )
                 total_tokens += ntok
 
@@ -428,8 +439,8 @@ class SystemOneEngine:
         k, cap = self.cfg.max_batch, self.cfg.max_batch_tokens
         out = []
         for g in range(0, len(rendered), k):
-            s, q = self._fit(state_text, [rq.text for rq in rendered[g : g + k]])
-            offsets, start, longest = self._last_offsets, 0, 0
+            s, q, offsets = self._fit(state_text, [rq.text for rq in rendered[g : g + k]])
+            start, longest = 0, 0
             for i, qi in enumerate(q):
                 if cap and i > start and (i - start + 1) * (len(s) + max(longest, len(qi))) > cap:
                     out.append((slice(g + start, g + i), s, q[start:i], offsets[start:i]))
