@@ -21,8 +21,9 @@ fallback is a safety valve rather than a different model.
 from __future__ import annotations
 
 import copy
+import threading
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -158,6 +159,14 @@ class SystemOneEngine:
             self._upcast_torso_for_cpu()
         self.tok = model.tokenizer
         self.device = self.cfg.device
+        # Sticky, monotonic False->True: cache the first UnforkableCache so later
+        # requests skip the shared-prefix path without racing on self.cfg.
+        self._prefix_cache_unforkable = False
+        # HuggingFace's fast tokenizer reconfigures its truncation/padding state on
+        # every call, which is not safe to run from two threads at once (it raises
+        # "Already borrowed", or silently uses another thread's max_length).
+        # Tokenisation is cheap relative to the model forward, so holding this is fine.
+        self._tok_lock = threading.Lock()
 
     def _upcast_torso_for_cpu(self) -> None:
         """Run a half-precision torso in fp32 on CPU.
@@ -208,33 +217,34 @@ class SystemOneEngine:
         concurrently on one engine, so engine state would be shared across requests.
         """
         max_len = self.model.config.max_length
-        enc = self.tok(question_texts, add_special_tokens=False,
-                       return_offsets_mapping=True)
-        q = enc["input_ids"]
-        offs = enc["offset_mapping"]
-        longest = max(len(x) for x in q)
-        if self.cfg.strict_window:
-            s = self.tok(state_text, add_special_tokens=True)["input_ids"]
-            if len(s) + longest > max_len:
-                raise ValueError(
-                    f"prompt of {len(s) + longest} tokens exceeds the context window "
-                    f"of {max_len} tokens"
-                )
-            return s, q, list(offs)
-        # Cap the reserve so a pathological question cannot starve the state entirely.
-        reserve = min(longest, max(1, int(max_len * self.cfg.max_question_fraction)))
-        # Front truncation shifts every token index, so the offsets move with the ids
-        # and a pointer readout keeps pointing at the right option.
-        cut = [max(0, len(x) - reserve) for x in q]
-        kept = [o[c:] for o, c in zip(offs, cut, strict=True)]
-        q = [x[c:] for x, c in zip(q, cut, strict=True)]
-        state_budget = max(1, max_len - reserve)
-        s = self.tok(
-            state_text,
-            add_special_tokens=True,
-            truncation=True,
-            max_length=state_budget,
-        )["input_ids"]
+        with self._tok_lock:
+            enc = self.tok(question_texts, add_special_tokens=False,
+                           return_offsets_mapping=True)
+            q = enc["input_ids"]
+            offs = enc["offset_mapping"]
+            longest = max(len(x) for x in q)
+            if self.cfg.strict_window:
+                s = self.tok(state_text, add_special_tokens=True)["input_ids"]
+                if len(s) + longest > max_len:
+                    raise ValueError(
+                        f"prompt of {len(s) + longest} tokens exceeds the context window "
+                        f"of {max_len} tokens"
+                    )
+                return s, q, list(offs)
+            # Cap the reserve so a pathological question cannot starve the state entirely.
+            reserve = min(longest, max(1, int(max_len * self.cfg.max_question_fraction)))
+            # Front truncation shifts every token index, so the offsets move with the ids
+            # and a pointer readout keeps pointing at the right option.
+            cut = [max(0, len(x) - reserve) for x in q]
+            kept = [o[c:] for o, c in zip(offs, cut, strict=True)]
+            q = [x[c:] for x, c in zip(q, cut, strict=True)]
+            state_budget = max(1, max_len - reserve)
+            s = self.tok(
+                state_text,
+                add_special_tokens=True,
+                truncation=True,
+                max_length=state_budget,
+            )["input_ids"]
         return s, q, kept
 
     def _option_idx(
@@ -398,7 +408,8 @@ class SystemOneEngine:
             # One question gains nothing from a shared prefix and pays a second forward:
             # measured on JevBench (one question per task), p50 0.111 s batched, 0.204 s
             # through the prefix path, with the same answers.
-            if self.cfg.use_prefix_cache and len(chunk_rendered) > 1:
+            if (self.cfg.use_prefix_cache and not self._prefix_cache_unforkable
+                    and len(chunk_rendered) > 1):
                 try:
                     probs, ntok = self._slot_probs_shared_prefix(
                         state_ids, question_ids, chunk_slots, chunk_kinds, offsets,
@@ -407,7 +418,7 @@ class SystemOneEngine:
                     total_tokens += ntok
                 except UnforkableCache as e:
                     print(f"[strands-decider] shared-prefix cache disabled ({e}); using batched encoding")
-                    self.cfg = replace(self.cfg, use_prefix_cache=False)
+                    self._prefix_cache_unforkable = True
             if probs is None:
                 probs, ntok = self._slot_probs_batched(
                     state_ids, question_ids, chunk_slots, chunk_kinds, offsets,

@@ -132,10 +132,10 @@ class MLXEngine(SystemOneEngine):
         self._decoder = decoder
         self._cache_owner = cache_owner
         # One evaluation at a time: mlx-lm's lazy arrays belong to the thread that
-        # produced them, and the server evaluates requests on its thread pool. The
-        # torch engine's `_last_offsets` race (#9) is now avoided by passing offsets
-        # through instead of leaving them on self.
+        # produced them, and the server runs requests on its thread pool.
         self._lock = threading.Lock()
+        self._prefix_cache_unforkable = False
+        self._tok_lock = threading.Lock()
 
     def evaluate(self, request: SystemOneRequest) -> SystemOneResponse:
         with self._lock:

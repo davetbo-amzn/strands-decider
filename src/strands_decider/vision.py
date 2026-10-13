@@ -474,7 +474,8 @@ class VisionEngine(SystemOneEngine):
         on the engine -- see `_fit` for the reason).
         """
         max_len = self.model.config.max_length
-        enc = self.tok(question_texts, add_special_tokens=False, return_offsets_mapping=True)
+        with self._tok_lock:
+            enc = self.tok(question_texts, add_special_tokens=False, return_offsets_mapping=True)
         q, offs = enc["input_ids"], enc["offset_mapping"]
         longest = max(len(x) for x in q)
 
@@ -482,8 +483,9 @@ class VisionEngine(SystemOneEngine):
         counts = image_tokens_for_grid(img["image_grid_thw"].tolist(), self.image_processor.merge_size)
         mm = {"pixel_values": img["pixel_values"].to(self.device),
               "image_grid_thw": img["image_grid_thw"].to(self.device)}
-        s = self.tok(expand_image_tokens(render_image_state(state, len(images)), counts),
-                     add_special_tokens=True)["input_ids"]
+        with self._tok_lock:
+            s = self.tok(expand_image_tokens(render_image_state(state, len(images)), counts),
+                         add_special_tokens=True)["input_ids"]
         vend = self.tok.convert_tokens_to_ids(VISION_END)
         keep = max(i for i, t in enumerate(s) if t == vend) + 1  # through the last image
 
